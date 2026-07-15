@@ -1,0 +1,11 @@
+-c constraints.txt
+ccxt>=4.3.0
+fastapi>=0.115.0
+matplotlib>=3.8.0
+pandas>=2.2.0
+plotly>=5.22.0
+pydantic>=2.7.0
+python-dotenv>=1.0.0
+requests>=2.32.0
+streamlit>=1.36.0
+uvicorn>=0.30.0

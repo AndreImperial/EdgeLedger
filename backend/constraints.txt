@@ -1,0 +1,12 @@
+# Baseline constraints captured during the 2026-07-14 audit.
+# Keep runtime requirements in requirements.txt; update this file intentionally.
+ccxt==4.5.65
+fastapi==0.125.0
+matplotlib==3.11.0
+pandas==3.0.3
+plotly==6.9.0
+pydantic==2.13.4
+python-dotenv==1.2.2
+requests==2.34.2
+streamlit==1.59.2
+uvicorn==0.51.0

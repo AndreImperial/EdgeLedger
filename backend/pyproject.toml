@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cmmtrader"
+version = "0.1.0"
+description = "Coach Miranda Miner crypto scanner, paper-trading, and alerting assistant."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ccxt>=4.3.0",
+    "matplotlib>=3.8.0",
+    "pandas>=2.2.0",
+    "plotly>=5.22.0",
+    "pydantic>=2.7.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.32.0",
+    "streamlit>=1.36.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "bandit>=1.7.10",
+    "pip-audit>=2.7.3",
+    "pytest>=8.3.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.6.9",
+]
+
+[tool.setuptools.packages.find]
+include = ["coach_miranda_miner*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.coverage.run]
+branch = true
+source = ["coach_miranda_miner"]
+omit = ["coach_miranda_miner/dashboard.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E9", "F"]
+ignore = [
+    "B008",
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
