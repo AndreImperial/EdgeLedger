@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: edgeledger
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: TRADING_MODE
+        value: paper
+      - key: DATA_MODE
+        value: bitunix
+      - key: ANALYZER_MODE
+        value: rule
+      - key: DISCOVERY_MODE
+        value: static
+      - key: EXCHANGE_IDS
+        value: bitunix
+      - key: EXCHANGE_ID
+        value: bitunix
+      - key: QUOTE_CURRENCY
+        value: USDT
+      - key: RENDER_CHARTS
+        value: "false"
