@@ -1,7 +1,7 @@
 FROM node:20.19.0-bookworm-slim AS frontend-build
 
 WORKDIR /frontend
-RUN corepack enable
+RUN npm install --global pnpm@10
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY . .
