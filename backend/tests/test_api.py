@@ -14,6 +14,7 @@ def test_frontend_fallback_before_or_after_build():
 
     assert response is not None
     assert any(route.path == "/api/health" for route in app.routes)
+    assert any(route.path == "/api/backtest-batch" for route in app.routes)
 
 
 def test_fixture_market_screener_contract():

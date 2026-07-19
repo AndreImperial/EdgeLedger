@@ -10,7 +10,7 @@ export type SignalLifecycle =
   | 'MANUALLY_DISMISSED'
 
 export type Direction = 'long' | 'short' | 'none'
-export type StrategyKey = 'bounce' | 'apex_squeeze' | 'transition_play' | 'tabo' | 'alma_cci_scalp'
+export type StrategyKey = 'bounce' | 'apex_squeeze' | 'transition_play' | 'tabo' | 'alma_cci_scalp' | 'ma_short'
 
 export interface NormalizedSignal {
   id: string
@@ -187,4 +187,22 @@ export interface OpenInterestRow {
   price: number | null
   status: string
   updated_at: string
+}
+
+export interface BacktestBatchRow {
+  symbol: string
+  timeframe: string
+  trades: number
+  win_rate: number
+  return_pct: number
+  drawdown_pct: number
+  profit_factor: number
+  expectancy_pct: number
+  long_trades: number
+  short_trades: number
+  best_setup?: string | null
+  validation_trades?: number
+  validation_win_rate?: number
+  validation_win_rate_delta?: number
+  validation_expectancy_pct?: number
 }

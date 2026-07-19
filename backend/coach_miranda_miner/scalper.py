@@ -122,7 +122,6 @@ class AlmaCciScalper:
         long_structure = _aligned_long(candles["5m"])
         short_structure = _aligned_short(candles["5m"])
         execution = candles["3m"]
-        last = execution.iloc[-1]
         rel_vol = _last_float(execution["relative_volume"]) or 0.0
 
         long_cross_age = _cross_age(execution["ema_9"], execution["alma_20"], "long", self.cross_fresh_bars)

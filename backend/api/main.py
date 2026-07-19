@@ -180,6 +180,28 @@ def backtest(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.post("/api/backtest-batch")
+def backtest_batch(
+    limit: int | None = Query(default=None),
+    timeframe: str = Query(default="15m"),
+    strategy: str = Query(default="ma"),
+    side: str = Query(default="auto"),
+    data_mode: str | None = Query(default=None),
+) -> dict[str, Any]:
+    try:
+        coach = _coach(data_mode)
+        rows = coach.batch_backtest(limit, timeframe, strategy, side)
+        return {
+            "source": coach.settings.data_mode,
+            "timeframe": timeframe,
+            "strategy": strategy,
+            "side": side,
+            "rows": rows,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/journal")
 def journal() -> dict[str, Any]:
     coach = _coach()

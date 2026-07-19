@@ -33,17 +33,25 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--symbol", default=None)
     backtest.add_argument("--timeframe", default=None)
     backtest.add_argument("--strategy", choices=["miranda", "ma", "scalp"], default="miranda")
-    backtest.add_argument("--side", choices=["both", "long", "short"], default="both")
+    backtest.add_argument("--side", choices=["auto", "both", "long", "short"], default="auto")
     batch = subparsers.add_parser("backtest-batch", help="Backtest the current top universe")
     batch.add_argument("--limit", type=int, default=None)
     batch.add_argument("--timeframe", default="15m")
     batch.add_argument("--strategy", choices=["miranda", "ma", "scalp"], default="miranda")
-    batch.add_argument("--side", choices=["both", "long", "short"], default="both")
+    batch.add_argument("--side", choices=["auto", "both", "long", "short"], default="auto")
+    optimize = subparsers.add_parser("optimize-backtest", help="Sweep strategy settings for higher win rate")
+    optimize.add_argument("--symbol", default=None)
+    optimize.add_argument("--timeframe", default="15m")
+    optimize.add_argument("--strategy", choices=["miranda", "ma", "scalp"], default="miranda")
+    optimize.add_argument("--side", choices=["auto", "both", "long", "short"], default="auto")
+    optimize.add_argument("--min-trades", type=int, default=30)
+    optimize.add_argument("--limit", type=int, default=10)
+    optimize.add_argument("--max-configs", type=int, default=100)
     walk = subparsers.add_parser("walk-forward", help="Run train/test walk-forward validation")
     walk.add_argument("--symbol", default=None)
     walk.add_argument("--timeframe", default=None)
     walk.add_argument("--strategy", choices=["miranda", "ma", "scalp"], default="miranda")
-    walk.add_argument("--side", choices=["both", "long", "short"], default="both")
+    walk.add_argument("--side", choices=["auto", "both", "long", "short"], default="auto")
     return parser
 
 
@@ -77,11 +85,44 @@ def main() -> None:
     if args.command == "backtest-batch":
         rows = coach.batch_backtest(args.limit, args.timeframe, args.strategy, args.side)
         for row in rows:
+            validation = ""
+            if "validation_win_rate" in row:
+                validation = (
+                    f" | validation {row['validation_trades']} trades "
+                    f"{row['validation_win_rate']:.1%} "
+                    f"delta {row['validation_win_rate_delta']:+.1%}"
+                )
             print(
                 f"{row['symbol']} | trades {row['trades']} | win {row['win_rate']:.1%} | "
                 f"return {row['return_pct']:.2f}% | expectancy {row['expectancy_pct']:.2f}% | "
                 f"PF {row['profit_factor']:.2f} | L/S {row['long_trades']}/{row['short_trades']} | "
                 f"best setup {row.get('best_setup') or 'n/a'}"
+                f"{validation}"
+            )
+    if args.command == "optimize-backtest":
+        rows = coach.optimize_backtest(
+            args.symbol,
+            args.timeframe,
+            args.strategy,
+            args.side,
+            args.min_trades,
+            args.limit,
+            args.max_configs,
+        )
+        for row in rows:
+            validation = ""
+            if "validation_win_rate" in row:
+                validation = (
+                    f" | validation {row['validation_trades']} trades "
+                    f"{row['validation_win_rate']:.1%} "
+                    f"delta {row['validation_win_rate_delta']:+.1%}"
+                )
+            print(
+                f"{row['symbol']} | trades {row['trades']} | win {row['win_rate']:.1%} | "
+                f"return {row['return_pct']:.2f}% | expectancy {row['expectancy_pct']:.2f}% | "
+                f"PF {row['profit_factor']:.2f} | L/S {row['long_trades']}/{row['short_trades']} | "
+                f"floor {row['win_rate_floor']:.1%} | {row['label']}"
+                f"{validation}"
             )
     if args.command == "walk-forward":
         result = coach.walk_forward_backtest(args.symbol, args.timeframe, args.strategy, args.side)
