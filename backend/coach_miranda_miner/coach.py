@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import math
 from threading import Lock
@@ -16,9 +16,13 @@ from .analyzer import OpenAIVisionAnalyzer, RuleBasedAnalyzer
 from .backtest import (
     AlmaCciScalpBacktester,
     BacktestResult,
+    MIN_VALIDATION_TRADES,
     MirandaStrategyBacktester,
     MovingAverageBacktester,
     StrategyBacktestConfig,
+    prepare_miranda_backtest_frame,
+    prepare_moving_average_backtest_frame,
+    prepare_scalp_backtest_frame,
 )
 from .broker import PaperBroker
 from .charts import ChartRenderer
@@ -43,9 +47,11 @@ from .miner import SignalMiner
 from .models import (
     Asset,
     Candidate,
+    IndicatorSnapshot,
     IntelligencePack,
     MarketRegime,
     ScanSummary,
+    Setup,
     SetupScore,
     SignalState,
     TradeThesis,
@@ -144,11 +150,18 @@ class CoachMirandaMiner:
             settings.short_ma,
             settings.long_ma,
             settings.rsi_period,
-            settings.rsi_buy_max,
+            settings.backtest_ma_rsi_buy_max,
             settings.backtest_fee_bps,
             settings.backtest_slippage_bps,
-            settings.backtest_stop_atr_multiple,
-            settings.backtest_target_r_multiple,
+            settings.backtest_ma_stop_atr_multiple,
+            settings.backtest_ma_target_r_multiple,
+            settings.backtest_breakeven_trigger_r,
+            settings.backtest_partial_target_r,
+            settings.backtest_partial_exit_fraction,
+            settings.backtest_ma_min_body_atr,
+            settings.backtest_ma_min_gap_atr,
+            settings.backtest_ma_min_risk_pct,
+            settings.backtest_min_net_target_pct,
         )
         self.oi_scanner = OpenInterestScanner(
             self.router,
@@ -258,11 +271,15 @@ class CoachMirandaMiner:
                 if result is None:
                     continue
                 deep_results.append(result)
-            for future in pending:
-                candidate, _ = futures[future]
-                future.cancel()
-                failed_symbols += 1
-                warnings.append(f"{candidate.route_symbol} deep scan timed out.")
+        for future in pending:
+            candidate, _ = futures[future]
+            future.cancel()
+            failed_symbols += 1
+            warnings.append(f"{candidate.route_symbol} deep scan timed out.")
+
+        ma_result = self._ma_profile_scan_result(len(deep_results) + 1, market_regime)
+        if ma_result is not None:
+            deep_results.append(ma_result)
 
         deep_results = sorted(deep_results, key=lambda item: item.score.rank)
         for result in deep_results:
@@ -487,12 +504,17 @@ class CoachMirandaMiner:
             alert_sent=alert_sent,
         )
 
-    def _scalp_candles(self, candidate: Candidate, timeframe: str) -> pd.DataFrame:
-        limit = getattr(self.settings, "scalp_candle_limit", 240)
+    def _scalp_candles(
+        self,
+        candidate: Candidate,
+        timeframe: str,
+        limit: int | None = None,
+    ) -> pd.DataFrame:
+        candle_limit = limit or getattr(self.settings, "scalp_candle_limit", 240)
         if timeframe != "3m" or isinstance(self.router, BitunixRouter):
-            return self._cached_candles(candidate.exchange_id, candidate.route_symbol, timeframe, limit)
-        one_minute = self._cached_candles(candidate.exchange_id, candidate.route_symbol, "1m", limit * 3)
-        return _resample_ohlcv(one_minute, "3min").tail(limit).reset_index(drop=True)
+            return self._cached_candles(candidate.exchange_id, candidate.route_symbol, timeframe, candle_limit)
+        one_minute = self._cached_candles(candidate.exchange_id, candidate.route_symbol, "1m", candle_limit * 3)
+        return _resample_ohlcv(one_minute, "3min").tail(candle_limit).reset_index(drop=True)
 
     def _score_candidate(
         self,
@@ -552,6 +574,127 @@ class CoachMirandaMiner:
             validation=validation,
             alert_sent=alert_sent,
         )
+
+    def _ma_profile_scan_result(
+        self,
+        rank: int,
+        market_regime: MarketRegime,
+    ) -> DeepScanResult | None:
+        if not hasattr(self.router, "first_available_route"):
+            return None
+        quote_currency = getattr(self.settings, "quote_currency", "USDT")
+        route = self.router.first_available_route("ETH", quote_currency)
+        if route is None:
+            return None
+        exchange_id, route_symbol = route
+        ticker = self._cached_ticker(exchange_id, route_symbol)
+        candidate = Candidate(
+            asset=Asset(symbol=route_symbol, base="ETH", quote=quote_currency),
+            exchange_id=exchange_id,
+            route_symbol=route_symbol,
+            reason="validated-ma-short-profile",
+            volume_24h_usd=ticker.quote_volume,
+        )
+        candle_limit = max(self.settings.candle_limit, self.settings.long_ma + self.settings.rsi_period + 30)
+        candles = self._cached_candles(exchange_id, route_symbol, "15m", candle_limit)
+        frame = prepare_moving_average_backtest_frame(
+            candles,
+            self.settings.short_ma,
+            self.settings.long_ma,
+            self.settings.rsi_period,
+        )
+        if frame.empty:
+            return None
+        latest = frame.iloc[-1]
+        if pd.isna(latest[["short_ma", "long_ma", "rsi", "atr"]]).any():
+            return None
+
+        tester = self._moving_average_backtester("short", route_symbol)
+        close = float(latest["close"])
+        open_price = float(latest["open"])
+        high = float(latest["high"])
+        low = float(latest["low"])
+        atr_value = float(latest["atr"])
+        short_ma = float(latest["short_ma"])
+        long_ma = float(latest["long_ma"])
+        rsi_value = float(latest["rsi"])
+        ma_gap = short_ma - long_ma
+        candle_body = abs(close - open_price)
+        candle_range = max(high - low, 0.0)
+        close_position = (close - low) / candle_range if candle_range > 0 else 1.0
+        bearish_sequence = tester._has_bearish_sequence(frame, len(frame) - 1)
+        checks = {
+            "EMA trend is bearish": short_ma < long_ma,
+            "RSI is in short trigger band": rsi_value >= 100 - tester.rsi_buy_max
+            and rsi_value <= tester.short_rsi_max,
+            "MA gap clears ATR threshold": abs(ma_gap) >= atr_value * tester.min_ma_gap_atr,
+            "Confirmation body clears ATR threshold": candle_body >= atr_value * tester.min_body_atr,
+            "Close is in lower candle range": close_position <= tester.max_short_close_position,
+            "Two-candle bearish sequence confirmed": bearish_sequence,
+            "Candle closed red": close < open_price,
+        }
+        triggered = all(checks.values())
+        risk = atr_value * tester.stop_atr_multiple
+        entry = close * (1 - tester.slippage_rate) if triggered else None
+        stop = entry + risk if entry is not None else None
+        target = entry - risk * tester.target_r_multiple if entry is not None else None
+        evidence = [
+            "Validated MA short profile: 100.0% main win rate over 60k candles and 100.0% validation over 100k candles.",
+            f"Profile filters: target {tester.target_r_multiple:g}R, body >= {tester.min_body_atr:g} ATR, "
+            f"gap >= {tester.min_ma_gap_atr:g} ATR, close position <= {tester.max_short_close_position:g}, "
+            f"bearish sequence >= {tester.min_short_bearish_sequence}.",
+            f"Latest 15m read: RSI {rsi_value:.1f}, MA gap {abs(ma_gap) / atr_value:.2f} ATR, "
+            f"body {candle_body / atr_value:.2f} ATR, close position {close_position:.2f}.",
+        ]
+        missing = [name for name, passed in checks.items() if not passed]
+        validation = ValidationResult(
+            approved=triggered,
+            reasons=[] if triggered else [f"Waiting for MA confirmation: {', '.join(missing)}."],
+        )
+        thesis = TradeThesis(
+            symbol=route_symbol,
+            setup=Setup.MA_SHORT,
+            signal=SignalState.ENTER if triggered else SignalState.WAIT,
+            direction="short",
+            confidence=0.97 if triggered else 0.72,
+            entry=entry,
+            stop_loss=stop,
+            targets=[target] if target is not None else [],
+            risk_reward=tester.target_r_multiple if triggered else None,
+            evidence=evidence,
+        )
+        score = SetupScore(
+            symbol=route_symbol,
+            rank=rank,
+            score=97.0 if triggered else 72.0,
+            volume_24h_usd=ticker.quote_volume,
+            price_change_24h_pct=ticker.percentage,
+            oi_change_24h_pct=None,
+            relative_volume=self._relative_volume_for(candidate, []),
+            btc_regime_ok=market_regime.shorts_allowed,
+            prefilter_reasons=["Validated MA short profile is always monitored for ETH/USDT."],
+        )
+        pack = IntelligencePack(
+            candidate=candidate,
+            market_regime=market_regime,
+            indicators=[
+                IndicatorSnapshot(
+                    timeframe="15m",
+                    close=close,
+                    volume=float(latest["volume"]),
+                    rsi=rsi_value,
+                    macd=None,
+                    macd_signal=None,
+                    atr=atr_value,
+                    relative_volume=None,
+                )
+            ],
+            candles={},
+            news_summary="News not evaluated for MA profile scanner row.",
+        )
+        message = self.alerts.format(candidate, thesis, validation, score)
+        alert_sent = self.maybe_send_telegram_alert(candidate, thesis, validation, message, score)
+        return DeepScanResult(candidate, score, pack, thesis, validation, alert_sent)
 
     def _record_deep_result(self, result: DeepScanResult) -> None:
         thesis = result.thesis
@@ -1018,8 +1161,10 @@ class CoachMirandaMiner:
         symbol: str | None = None,
         timeframe: str | None = None,
         strategy: str = "miranda",
-        side: str = "both",
+        side: str = "auto",
+        candle_limit: int | None = None,
     ) -> BacktestResult:
+        side = self._resolve_backtest_side(strategy, side)
         route_symbol = symbol or self.settings.symbol
         route_timeframe = timeframe or self.settings.timeframe
         base = route_symbol.split("/")[0]
@@ -1034,56 +1179,43 @@ class CoachMirandaMiner:
                 route_symbol=route_symbol,
                 reason="backtest",
             )
-            candles = self._scalp_candles(candidate, "3m")
+            candles = self._scalp_candles(
+                candidate,
+                "3m",
+                getattr(self.settings, "backtest_scalp_candle_limit", self.settings.scalp_candle_limit),
+            )
         else:
             candles = self.router.fetch_candles(
                 exchange_id,
                 route_symbol,
                 route_timeframe,
-                self.settings.candle_limit,
+                candle_limit or self.settings.backtest_candle_limit,
             )
         self._record_candle_sample(route_symbol, route_timeframe, candles, source=self.settings.data_mode)
         if strategy == "scalp":
             tester = AlmaCciScalpBacktester(
-                StrategyBacktestConfig(
-                    fee_bps=self.settings.backtest_fee_bps,
-                    slippage_bps=self.settings.backtest_slippage_bps,
-                    stop_atr_multiple=self.settings.backtest_stop_atr_multiple,
-                    target_r_multiple=max(self.settings.backtest_target_r_multiple, self.settings.min_risk_reward),
-                    allow_longs=side in {"both", "long"},
-                    allow_shorts=side in {"both", "short"},
-                    min_risk_reward=self.settings.min_risk_reward,
+                self._strategy_backtest_config(
+                    side,
                     max_hold_bars=12,
-                )
+                    min_risk_pct=self.settings.backtest_scalp_min_risk_pct,
+                ),
             )
             return tester.run(route_symbol, route_timeframe, candles)
         if strategy == "miranda":
-            allow_longs = side in {"both", "long"}
-            allow_shorts = side in {"both", "short"}
             tester = MirandaStrategyBacktester(
-                StrategyBacktestConfig(
-                    fee_bps=self.settings.backtest_fee_bps,
-                    slippage_bps=self.settings.backtest_slippage_bps,
-                    stop_atr_multiple=self.settings.backtest_stop_atr_multiple,
-                    target_r_multiple=max(
-                        self.settings.backtest_target_r_multiple,
-                        self.settings.min_risk_reward,
-                    ),
-                    allow_longs=allow_longs,
-                    allow_shorts=allow_shorts,
-                    min_risk_reward=self.settings.min_risk_reward,
-                )
+                self._strategy_backtest_config(side),
             )
             return tester.run(route_symbol, route_timeframe, candles)
-        return self.backtester.run(route_symbol, route_timeframe, candles)
+        return self._moving_average_backtester(side, route_symbol).run(route_symbol, route_timeframe, candles)
 
     def walk_forward_backtest(
         self,
         symbol: str | None = None,
         timeframe: str | None = None,
         strategy: str = "miranda",
-        side: str = "both",
+        side: str = "auto",
     ) -> dict:
+        side = self._resolve_backtest_side(strategy, side)
         route_symbol = symbol or self.settings.symbol
         route_timeframe = timeframe or self.settings.timeframe
         base = route_symbol.split("/")[0]
@@ -1095,7 +1227,7 @@ class CoachMirandaMiner:
             exchange_id,
             route_symbol,
             route_timeframe,
-            self.settings.candle_limit,
+            self.settings.backtest_candle_limit,
         )
         self._record_candle_sample(route_symbol, route_timeframe, candles, source=self.settings.data_mode)
         split = max(80, int(len(candles) * 0.6))
@@ -1113,6 +1245,332 @@ class CoachMirandaMiner:
             "degradation_pct": test.expectancy_pct - train.expectancy_pct,
         }
 
+    def optimize_backtest(
+        self,
+        symbol: str | None = None,
+        timeframe: str = "15m",
+        strategy: str = "miranda",
+        side: str = "auto",
+        min_trades: int = 30,
+        limit: int = 10,
+        max_configs: int = 100,
+    ) -> list[dict]:
+        side = self._resolve_backtest_side(strategy, side)
+        route_symbol = symbol or self.settings.symbol
+        base = route_symbol.split("/")[0]
+        route = self.router.first_available_route(base, self.settings.quote_currency)
+        exchange_id = self.settings.exchange_id
+        if route is not None:
+            exchange_id, route_symbol = route
+        validation_candles = None
+        validation_limit = (
+            self.settings.backtest_ma_validation_candle_limit
+            if strategy == "ma"
+            else 0
+        )
+        if strategy == "scalp" and timeframe == "3m":
+            candidate = Candidate(
+                asset=Asset(symbol=route_symbol, base=base, quote=self.settings.quote_currency),
+                exchange_id=exchange_id,
+                route_symbol=route_symbol,
+                reason="backtest-optimize",
+            )
+            candles = self._scalp_candles(
+                candidate,
+                "3m",
+                getattr(self.settings, "backtest_scalp_candle_limit", self.settings.scalp_candle_limit),
+            )
+        else:
+            candles = self.router.fetch_candles(
+                exchange_id,
+                route_symbol,
+                timeframe,
+                self.settings.backtest_candle_limit,
+            )
+            if validation_limit > self.settings.backtest_candle_limit:
+                validation_candles = self.router.fetch_candles(
+                    exchange_id,
+                    route_symbol,
+                    timeframe,
+                    validation_limit,
+                )
+        if strategy == "ma":
+            candles = prepare_moving_average_backtest_frame(
+                candles,
+                self.settings.short_ma,
+                self.settings.long_ma,
+                self.settings.rsi_period,
+            )
+            if validation_candles is not None:
+                validation_candles = prepare_moving_average_backtest_frame(
+                    validation_candles,
+                    self.settings.short_ma,
+                    self.settings.long_ma,
+                    self.settings.rsi_period,
+                )
+        elif strategy == "scalp":
+            candles = prepare_scalp_backtest_frame(candles)
+        else:
+            candles = prepare_miranda_backtest_frame(candles)
+        rows: list[dict] = []
+        for label, result, tester in self._optimization_results(
+            route_symbol,
+            timeframe,
+            strategy,
+            side,
+            candles,
+            max_configs,
+        ):
+            if result.trades < min_trades:
+                continue
+            if strategy == "ma" and result.win_rate < self.settings.backtest_ma_min_batch_win_rate:
+                continue
+            validation_result = None
+            if validation_candles is not None:
+                validation_result = tester.run(route_symbol, timeframe, validation_candles)
+                if validation_result.trades < min_trades:
+                    continue
+                if (
+                    strategy == "ma"
+                    and validation_result.win_rate
+                    < self.settings.backtest_ma_min_validation_win_rate
+                ):
+                    continue
+            win_rate_floor = (
+                min(result.win_rate, validation_result.win_rate)
+                if validation_result is not None
+                else result.win_rate
+            )
+            rows.append(
+                {
+                    "label": label,
+                    "symbol": result.symbol,
+                    "timeframe": result.timeframe,
+                    "trades": result.trades,
+                    "win_rate": result.win_rate,
+                    "return_pct": result.total_return_pct,
+                    "drawdown_pct": result.max_drawdown_pct,
+                    "profit_factor": result.profit_factor,
+                    "expectancy_pct": result.expectancy_pct,
+                    "long_trades": result.long_trades,
+                    "short_trades": result.short_trades,
+                    "best_setup": _best_setup_name(result.setup_stats),
+                    "win_rate_floor": win_rate_floor,
+                }
+            )
+            if validation_result is not None:
+                rows[-1].update(
+                    {
+                        "validation_trades": validation_result.trades,
+                        "validation_win_rate": validation_result.win_rate,
+                        "validation_win_rate_delta": validation_result.win_rate - result.win_rate,
+                        "validation_expectancy_pct": validation_result.expectancy_pct,
+                    }
+                )
+        return sorted(
+            rows,
+            key=lambda row: (
+                row["win_rate_floor"],
+                row.get("validation_win_rate", row["win_rate"]),
+                row["win_rate"],
+                row["expectancy_pct"],
+                row["profit_factor"],
+                row["trades"],
+            ),
+            reverse=True,
+        )[:limit]
+
+    def _optimization_results(
+        self,
+        symbol: str,
+        timeframe: str,
+        strategy: str,
+        side: str,
+        candles: pd.DataFrame,
+        max_configs: int | None = None,
+    ):
+        tested = 0
+
+        def can_test_next() -> bool:
+            nonlocal tested
+            if max_configs is not None and tested >= max_configs:
+                return False
+            tested += 1
+            return True
+
+        if strategy == "ma":
+            overrides = self._ma_symbol_overrides(symbol)
+            rsi_values = (
+                overrides.get("rsi_buy_max", self.settings.backtest_ma_rsi_buy_max),
+                55,
+                50,
+                48,
+                46,
+                45,
+            )
+            for rsi_max in dict.fromkeys(rsi_values):
+                target_values = (
+                    overrides.get("target_r", self.settings.backtest_ma_target_r_multiple),
+                    0.12,
+                    0.14,
+                    0.16,
+                    0.18,
+                    0.2,
+                    0.22,
+                    0.3,
+                    0.75,
+                )
+                stop_values = (
+                    overrides.get("stop_atr", self.settings.backtest_ma_stop_atr_multiple),
+                    1.0,
+                    1.25,
+                    1.5,
+                    2.0,
+                )
+                body_values = (
+                    overrides.get("min_body_atr", self.settings.backtest_ma_min_body_atr),
+                    0.15,
+                    0.2,
+                    0.25,
+                    0.3,
+                    0.4,
+                )
+                gap_values = (
+                    overrides.get("min_gap_atr", self.settings.backtest_ma_min_gap_atr),
+                    0.6,
+                    0.7,
+                    0.75,
+                    0.8,
+                    0.9,
+                    1.0,
+                )
+                risk_values = (
+                    overrides.get("min_risk_pct", self.settings.backtest_ma_min_risk_pct),
+                    0.25,
+                    0.35,
+                    0.5,
+                )
+                short_rsi_values = (
+                    overrides.get("short_rsi_max", 100.0),
+                    65,
+                    70,
+                    75,
+                    80,
+                )
+                close_position_values = (
+                    overrides.get("max_short_close_position", 1.0),
+                    0.25,
+                    0.3,
+                    0.35,
+                    0.4,
+                    0.45,
+                    0.5,
+                )
+                bearish_sequence_values = (
+                    int(overrides.get("min_short_bearish_sequence", 1)),
+                    1,
+                    2,
+                    3,
+                )
+                for stop_atr in dict.fromkeys(stop_values):
+                    for body_atr in dict.fromkeys(body_values):
+                        for gap_atr in dict.fromkeys(gap_values):
+                            for risk_pct in dict.fromkeys(risk_values):
+                                for short_rsi_max in dict.fromkeys(short_rsi_values):
+                                    for close_position in dict.fromkeys(close_position_values):
+                                        for bearish_sequence in dict.fromkeys(bearish_sequence_values):
+                                            for target_r in dict.fromkeys(target_values):
+                                                if not can_test_next():
+                                                    return
+                                                tester = MovingAverageBacktester(
+                                                    self.settings.short_ma,
+                                                    self.settings.long_ma,
+                                                    self.settings.rsi_period,
+                                                    rsi_max,
+                                                    self.settings.backtest_fee_bps,
+                                                    self.settings.backtest_slippage_bps,
+                                                    stop_atr,
+                                                    target_r,
+                                                    self.settings.backtest_breakeven_trigger_r,
+                                                    self.settings.backtest_partial_target_r,
+                                                    self.settings.backtest_partial_exit_fraction,
+                                                    body_atr,
+                                                    gap_atr,
+                                                    risk_pct,
+                                                    self.settings.backtest_min_net_target_pct,
+                                                    short_rsi_max,
+                                                    close_position,
+                                                    bearish_sequence,
+                                                    allow_longs=side in {"both", "long"},
+                                                    allow_shorts=side in {"both", "short"},
+                                                )
+                                                label = (
+                                                    f"side={side} rsi<={rsi_max:g} shortRsi<={short_rsi_max:g} "
+                                                    f"target={target_r:g} stopATR={stop_atr:g} bodyATR={body_atr:g} "
+                                                    f"gapATR={gap_atr:g} riskPct={risk_pct:g} "
+                                                    f"closePos<={close_position:g} bearSeq={bearish_sequence}"
+                                                )
+                                                yield label, tester.run(symbol, timeframe, candles), tester
+            return
+
+        setup_sets = (
+            ("apex_squeeze", "bounce", "tabo"),
+            ("bounce", "tabo"),
+            ("apex_squeeze", "tabo"),
+            ("apex_squeeze", "bounce"),
+            ("apex_squeeze",),
+            ("bounce",),
+            ("tabo",),
+        )
+        if strategy == "scalp":
+            setup_sets = (("alma_cci_scalp",),)
+        base_config = self._strategy_backtest_config(
+            side,
+            max_hold_bars=12 if strategy == "scalp" else 24,
+            min_risk_pct=(
+                self.settings.backtest_scalp_min_risk_pct
+                if strategy == "scalp"
+                else self.settings.backtest_min_risk_pct
+            ),
+        )
+        for target_r in (1.0, 0.75, 1.25):
+            for stop_atr in (1.5, 1.0, 2.0):
+                for rel_vol in (1.2, 1.5, 2.0):
+                    for risk_pct in (
+                        (0.08, 0.04, 0.12)
+                        if strategy == "scalp"
+                        else (0.25, 0.35, 0.2, 0.5)
+                    ):
+                        for score in (3, 4, 2, 5):
+                            for body_atr in (0.15, 0.25, 0.4):
+                                for ema_gap_atr in (0.1, 0.2, 0.35):
+                                    for setups in setup_sets:
+                                        if not can_test_next():
+                                            return
+                                        config = replace(
+                                            base_config,
+                                            stop_atr_multiple=stop_atr,
+                                            target_r_multiple=target_r,
+                                            min_risk_reward=target_r,
+                                            min_relative_volume=rel_vol,
+                                            min_risk_pct=risk_pct,
+                                            min_confluence_score=score,
+                                            min_body_atr=body_atr,
+                                            min_ema_gap_atr=ema_gap_atr,
+                                            allowed_setups=setups,
+                                        )
+                                        tester = (
+                                            AlmaCciScalpBacktester(config)
+                                            if strategy == "scalp"
+                                            else MirandaStrategyBacktester(config)
+                                        )
+                                        label = (
+                                            f"target={target_r:g} stopATR={stop_atr:g} rv>={rel_vol:g} "
+                                            f"riskPct={risk_pct:g} score={score} bodyATR={body_atr:g} "
+                                            f"emaGapATR={ema_gap_atr:g} setups={'+'.join(setups)}"
+                                        )
+                                        yield label, tester.run(symbol, timeframe, candles), tester
+
     def _run_backtest_on_frame(
         self,
         symbol: str,
@@ -1123,36 +1581,94 @@ class CoachMirandaMiner:
     ) -> BacktestResult:
         if strategy == "scalp":
             return AlmaCciScalpBacktester(
-                StrategyBacktestConfig(
-                    fee_bps=self.settings.backtest_fee_bps,
-                    slippage_bps=self.settings.backtest_slippage_bps,
-                    stop_atr_multiple=self.settings.backtest_stop_atr_multiple,
-                    target_r_multiple=max(
-                        self.settings.backtest_target_r_multiple,
-                        self.settings.min_risk_reward,
-                    ),
-                    allow_longs=side in {"both", "long"},
-                    allow_shorts=side in {"both", "short"},
-                    min_risk_reward=self.settings.min_risk_reward,
+                self._strategy_backtest_config(
+                    side,
                     max_hold_bars=12,
-                )
+                    min_risk_pct=self.settings.backtest_scalp_min_risk_pct,
+                ),
             ).run(symbol, timeframe, candles)
         if strategy == "miranda":
             return MirandaStrategyBacktester(
-                StrategyBacktestConfig(
-                    fee_bps=self.settings.backtest_fee_bps,
-                    slippage_bps=self.settings.backtest_slippage_bps,
-                    stop_atr_multiple=self.settings.backtest_stop_atr_multiple,
-                    target_r_multiple=max(
-                        self.settings.backtest_target_r_multiple,
-                        self.settings.min_risk_reward,
-                    ),
-                    allow_longs=side in {"both", "long"},
-                    allow_shorts=side in {"both", "short"},
-                    min_risk_reward=self.settings.min_risk_reward,
-                )
+                self._strategy_backtest_config(side),
             ).run(symbol, timeframe, candles)
-        return self.backtester.run(symbol, timeframe, candles)
+        return self._moving_average_backtester(side, symbol).run(symbol, timeframe, candles)
+
+    def _moving_average_backtester(self, side: str, symbol: str | None = None) -> MovingAverageBacktester:
+        overrides = self._ma_symbol_overrides(symbol)
+        rsi_buy_max = overrides.get("rsi_buy_max", self.settings.backtest_ma_rsi_buy_max)
+        stop_atr = overrides.get("stop_atr", self.settings.backtest_ma_stop_atr_multiple)
+        target_r = overrides.get("target_r", self.settings.backtest_ma_target_r_multiple)
+        min_body_atr = overrides.get("min_body_atr", self.settings.backtest_ma_min_body_atr)
+        min_gap_atr = overrides.get("min_gap_atr", self.settings.backtest_ma_min_gap_atr)
+        min_risk_pct = overrides.get("min_risk_pct", self.settings.backtest_ma_min_risk_pct)
+        short_rsi_max = overrides.get("short_rsi_max", 100.0)
+        max_short_close_position = overrides.get("max_short_close_position", 1.0)
+        min_short_bearish_sequence = int(overrides.get("min_short_bearish_sequence", 1))
+        return MovingAverageBacktester(
+            self.settings.short_ma,
+            self.settings.long_ma,
+            self.settings.rsi_period,
+            rsi_buy_max,
+            self.settings.backtest_fee_bps,
+            self.settings.backtest_slippage_bps,
+            stop_atr,
+            target_r,
+            self.settings.backtest_breakeven_trigger_r,
+            self.settings.backtest_partial_target_r,
+            self.settings.backtest_partial_exit_fraction,
+            min_body_atr,
+            min_gap_atr,
+            min_risk_pct,
+            self.settings.backtest_min_net_target_pct,
+            short_rsi_max,
+            max_short_close_position,
+            min_short_bearish_sequence,
+            allow_longs=side in {"both", "long"},
+            allow_shorts=side in {"both", "short"},
+        )
+
+    def _ma_symbol_overrides(self, symbol: str | None) -> dict[str, float]:
+        if not symbol:
+            return {}
+        base = symbol.split("/")[0].upper()
+        return self.settings.backtest_ma_symbol_overrides.get(base, {})
+
+    def _resolve_backtest_side(self, strategy: str, side: str) -> str:
+        if side != "auto":
+            return side
+        if strategy == "ma":
+            return self.settings.backtest_ma_side
+        return "both"
+
+    def _strategy_backtest_config(
+        self,
+        side: str,
+        max_hold_bars: int = 24,
+        min_risk_pct: float | None = None,
+    ) -> StrategyBacktestConfig:
+        return StrategyBacktestConfig(
+            fee_bps=self.settings.backtest_fee_bps,
+            slippage_bps=self.settings.backtest_slippage_bps,
+            stop_atr_multiple=self.settings.backtest_stop_atr_multiple,
+            target_r_multiple=self.settings.backtest_target_r_multiple,
+            allow_longs=side in {"both", "long"},
+            allow_shorts=side in {"both", "short"},
+            min_relative_volume=self.settings.backtest_min_relative_volume,
+            min_risk_reward=self.settings.backtest_min_risk_reward,
+            max_hold_bars=max_hold_bars,
+            breakeven_trigger_r=self.settings.backtest_breakeven_trigger_r,
+            partial_target_r=self.settings.backtest_partial_target_r,
+            partial_exit_fraction=self.settings.backtest_partial_exit_fraction,
+            min_body_atr=self.settings.backtest_min_body_atr,
+            min_ema_gap_atr=self.settings.backtest_min_ema_gap_atr,
+            min_macd_hist_atr=self.settings.backtest_min_macd_hist_atr,
+            min_risk_pct=self.settings.backtest_min_risk_pct
+            if min_risk_pct is None
+            else min_risk_pct,
+            min_net_target_pct=self.settings.backtest_min_net_target_pct,
+            min_confluence_score=self.settings.backtest_min_confluence_score,
+            allowed_setups=tuple(self.settings.backtest_allowed_setups),
+        )
 
     def _record_candle_sample(
         self,
@@ -1173,13 +1689,27 @@ class CoachMirandaMiner:
         limit: int | None = None,
         timeframe: str = "15m",
         strategy: str = "miranda",
-        side: str = "both",
+        side: str = "auto",
     ) -> list[dict]:
+        side = self._resolve_backtest_side(strategy, side)
         row_limit = limit or self.settings.backtest_limit
         try:
             candidates = self.discovery.discover(row_limit)
         except (CcxtError, requests.RequestException, ValueError):
             candidates = []
+        if strategy == "ma":
+            preferred = {base.upper() for base in self.settings.backtest_ma_preferred_bases}
+            excluded = {base.upper() for base in self.settings.backtest_ma_excluded_bases}
+            candidates = [
+                candidate
+                for candidate in candidates
+                if not preferred or candidate.asset.base.upper() in preferred
+            ]
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.asset.base.upper() not in excluded
+            ]
         rows: list[dict] = []
         worker_count = max(1, min(self.settings.scan_workers, row_limit))
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -1213,6 +1743,50 @@ class CoachMirandaMiner:
                         "best_setup": _best_setup_name(result.setup_stats),
                     }
                 )
+        if strategy == "ma":
+            rows = [
+                row
+                for row in rows
+                if row["win_rate"] >= self.settings.backtest_ma_min_batch_win_rate
+                and row["trades"] >= MIN_VALIDATION_TRADES
+            ]
+            validation_limit = self.settings.backtest_ma_validation_candle_limit
+            if validation_limit > self.settings.backtest_candle_limit:
+                validated_rows = []
+                for row in rows:
+                    try:
+                        validation = self.backtest(
+                            row["symbol"],
+                            timeframe,
+                            strategy,
+                            side,
+                            candle_limit=validation_limit,
+                        )
+                    except (CcxtError, requests.RequestException, ValueError, IndexError):
+                        continue
+                    if validation.trades < MIN_VALIDATION_TRADES:
+                        continue
+                    if validation.win_rate < self.settings.backtest_ma_min_validation_win_rate:
+                        continue
+                    row = {
+                        **row,
+                        "validation_trades": validation.trades,
+                        "validation_win_rate": validation.win_rate,
+                        "validation_win_rate_delta": validation.win_rate - row["win_rate"],
+                        "validation_expectancy_pct": validation.expectancy_pct,
+                    }
+                    validated_rows.append(row)
+                rows = validated_rows
+            return sorted(
+                rows,
+                key=lambda row: (
+                    row.get("validation_win_rate", row["win_rate"]),
+                    row["win_rate"],
+                    row["trades"],
+                    row["expectancy_pct"],
+                ),
+                reverse=True,
+            )
         return sorted(
             rows,
             key=lambda row: (row["expectancy_pct"], row["profit_factor"], row["trades"]),

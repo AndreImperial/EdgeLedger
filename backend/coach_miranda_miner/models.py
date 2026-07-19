@@ -16,6 +16,7 @@ class Setup(str, Enum):
     TRANSITION_PLAY = "transition_play"
     TABO = "tabo"
     ALMA_CCI_SCALP = "alma_cci_scalp"
+    MA_SHORT = "ma_short"
     NONE = "none"
 
 

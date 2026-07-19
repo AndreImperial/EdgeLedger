@@ -10,6 +10,66 @@ from .indicators import alma, atr, cci, ema, macd, moving_average, relative_volu
 MIN_VALIDATION_TRADES = 30
 
 
+def prepare_moving_average_backtest_frame(
+    candles: pd.DataFrame,
+    short_ma: int,
+    long_ma: int,
+    rsi_period: int,
+) -> pd.DataFrame:
+    frame = candles.copy()
+    if "short_ma" not in frame:
+        frame["short_ma"] = moving_average(frame["close"], short_ma)
+    if "long_ma" not in frame:
+        frame["long_ma"] = moving_average(frame["close"], long_ma)
+    if "rsi" not in frame:
+        frame["rsi"] = rsi(frame["close"], rsi_period)
+    if "atr" not in frame:
+        frame["atr"] = atr(frame, 14)
+    return frame
+
+
+def prepare_miranda_backtest_frame(candles: pd.DataFrame) -> pd.DataFrame:
+    frame = candles.copy().reset_index(drop=True)
+    if "rsi" not in frame:
+        frame["rsi"] = rsi(frame["close"], 14)
+    if "macd" not in frame or "macd_signal" not in frame:
+        frame["macd"], frame["macd_signal"] = macd(frame["close"])
+    if "atr" not in frame:
+        frame["atr"] = atr(frame, 14)
+    if "relative_volume" not in frame:
+        frame["relative_volume"] = relative_volume(frame["volume"], 20)
+    if "ema_20" not in frame:
+        frame["ema_20"] = frame["close"].ewm(span=20, adjust=False).mean()
+    if "ema_50" not in frame:
+        frame["ema_50"] = frame["close"].ewm(span=50, adjust=False).mean()
+    if "long_setup" not in frame or "short_setup" not in frame:
+        long_setups: list[str | None] = [None] * len(frame)
+        short_setups: list[str | None] = [None] * len(frame)
+        for index in range(60, len(frame)):
+            recent = frame.iloc[index - 24 : index + 1]
+            prior = frame.iloc[index - 60 : index]
+            long_setups[index] = _long_setup_name(recent, prior)
+            short_setups[index] = _short_setup_name(recent, prior)
+        frame["long_setup"] = long_setups
+        frame["short_setup"] = short_setups
+    return frame
+
+
+def prepare_scalp_backtest_frame(candles: pd.DataFrame) -> pd.DataFrame:
+    frame = candles.copy().reset_index(drop=True)
+    if "ema_9" not in frame:
+        frame["ema_9"] = ema(frame["close"], 9)
+    if "alma_20" not in frame:
+        frame["alma_20"] = alma(frame["close"], 20, 0.8, 8)
+    if "cci_20" not in frame:
+        frame["cci_20"] = cci(frame, 20)
+    if "atr" not in frame:
+        frame["atr"] = atr(frame, 14)
+    if "relative_volume" not in frame:
+        frame["relative_volume"] = relative_volume(frame["volume"], 20)
+    return frame
+
+
 @dataclass(frozen=True)
 class BacktestResult:
     symbol: str
@@ -81,6 +141,18 @@ class MovingAverageBacktester:
         slippage_bps: float,
         stop_atr_multiple: float,
         target_r_multiple: float,
+        breakeven_trigger_r: float = 99.0,
+        partial_target_r: float = 1.0,
+        partial_exit_fraction: float = 0.0,
+        min_body_atr: float = 0.0,
+        min_ma_gap_atr: float = 0.0,
+        min_risk_pct: float = 0.0,
+        min_net_target_pct: float = 0.0,
+        short_rsi_max: float = 100.0,
+        max_short_close_position: float = 1.0,
+        min_short_bearish_sequence: int = 1,
+        allow_longs: bool = True,
+        allow_shorts: bool = False,
     ) -> None:
         self.short_ma = short_ma
         self.long_ma = long_ma
@@ -90,15 +162,29 @@ class MovingAverageBacktester:
         self.slippage_rate = slippage_bps / 10_000
         self.stop_atr_multiple = stop_atr_multiple
         self.target_r_multiple = target_r_multiple
+        self.breakeven_trigger_r = breakeven_trigger_r
+        self.partial_target_r = partial_target_r
+        self.partial_exit_fraction = partial_exit_fraction
+        self.min_body_atr = min_body_atr
+        self.min_ma_gap_atr = min_ma_gap_atr
+        self.min_risk_pct = min_risk_pct
+        self.min_net_target_pct = min_net_target_pct
+        self.short_rsi_max = short_rsi_max
+        self.max_short_close_position = max_short_close_position
+        self.min_short_bearish_sequence = min_short_bearish_sequence
+        self.allow_longs = allow_longs
+        self.allow_shorts = allow_shorts
 
     def run(self, symbol: str, timeframe: str, candles: pd.DataFrame) -> BacktestResult:
-        frame = candles.copy()
-        frame["short_ma"] = moving_average(frame["close"], self.short_ma)
-        frame["long_ma"] = moving_average(frame["close"], self.long_ma)
-        frame["rsi"] = rsi(frame["close"], self.rsi_period)
-        frame["atr"] = atr(frame, 14)
+        frame = prepare_moving_average_backtest_frame(
+            candles,
+            self.short_ma,
+            self.long_ma,
+            self.rsi_period,
+        )
 
         in_position = False
+        position_direction = "long"
         entry_price = 0.0
         stop_price = 0.0
         target_price = 0.0
@@ -107,9 +193,11 @@ class MovingAverageBacktester:
         max_drawdown = 0.0
         wins = 0
         losses = 0
+        long_trades = 0
+        short_trades = 0
         returns: list[float] = []
 
-        for row in frame.itertuples(index=False):
+        for index, row in enumerate(frame.itertuples(index=False)):
             if (
                 pd.isna(row.short_ma)
                 or pd.isna(row.long_ma)
@@ -118,22 +206,111 @@ class MovingAverageBacktester:
             ):
                 continue
 
-            if not in_position and row.short_ma > row.long_ma and row.rsi <= self.rsi_buy_max:
+            ma_gap = float(row.short_ma) - float(row.long_ma)
+            candle_body = abs(float(row.close) - float(row.open))
+            candle_range = max(float(row.high) - float(row.low), 0.0)
+            close_position = (
+                (float(row.close) - float(row.low)) / candle_range
+                if candle_range > 0
+                else 1.0
+            )
+            long_entry = (
+                self.allow_longs
+                and row.short_ma > row.long_ma
+                and row.rsi <= self.rsi_buy_max
+                and ma_gap >= float(row.atr) * self.min_ma_gap_atr
+                and candle_body >= float(row.atr) * self.min_body_atr
+                and float(row.close) > float(row.open)
+            )
+            short_entry = (
+                self.allow_shorts
+                and row.short_ma < row.long_ma
+                and row.rsi >= 100 - self.rsi_buy_max
+                and row.rsi <= self.short_rsi_max
+                and abs(ma_gap) >= float(row.atr) * self.min_ma_gap_atr
+                and candle_body >= float(row.atr) * self.min_body_atr
+                and close_position <= self.max_short_close_position
+                and self._has_bearish_sequence(frame, index)
+                and float(row.close) < float(row.open)
+            )
+            if (
+                not in_position
+                and (long_entry or short_entry)
+            ):
                 in_position = True
-                entry_price = float(row.close) * (1 + self.slippage_rate)
+                position_direction = "long" if long_entry else "short"
+                entry_price = float(row.close) * (
+                    1 + self.slippage_rate if position_direction == "long" else 1 - self.slippage_rate
+                )
                 risk = float(row.atr) * self.stop_atr_multiple
-                stop_price = entry_price - risk
-                target_price = entry_price + (risk * self.target_r_multiple)
+                if entry_price > 0 and (risk / entry_price) * 100 < self.min_risk_pct:
+                    in_position = False
+                    continue
+                if position_direction == "long":
+                    stop_price = entry_price - risk
+                    target_price = entry_price + (risk * self.target_r_multiple)
+                    target_exit = target_price * (1 - self.slippage_rate)
+                    net_target_return = ((target_exit - entry_price) / entry_price) - (self.fee_rate * 2)
+                    long_trades += 1
+                else:
+                    stop_price = entry_price + risk
+                    target_price = entry_price - (risk * self.target_r_multiple)
+                    target_exit = target_price * (1 + self.slippage_rate)
+                    net_target_return = ((entry_price - target_exit) / entry_price) - (self.fee_rate * 2)
+                    short_trades += 1
+                if net_target_return * 100 < self.min_net_target_pct:
+                    in_position = False
+                    if position_direction == "long":
+                        long_trades -= 1
+                    else:
+                        short_trades -= 1
+                    continue
+                partial_taken = False
+                partial_return = 0.0
+                working_stop = stop_price
                 continue
 
             if in_position:
                 exit_price = None
-                if float(row.low) <= stop_price:
-                    exit_price = stop_price * (1 - self.slippage_rate)
-                elif float(row.high) >= target_price:
-                    exit_price = target_price * (1 - self.slippage_rate)
-                elif row.short_ma < row.long_ma:
-                    exit_price = float(row.close) * (1 - self.slippage_rate)
+                high = float(row.high)
+                low = float(row.low)
+                risk = abs(entry_price - stop_price)
+                if position_direction == "long":
+                    if (
+                        not partial_taken
+                        and self.partial_exit_fraction > 0
+                        and high >= entry_price + risk * self.partial_target_r
+                    ):
+                        partial_exit = (entry_price + risk * self.partial_target_r) * (1 - self.slippage_rate)
+                        partial_return = (partial_exit - entry_price) / entry_price
+                        partial_taken = True
+                        working_stop = entry_price
+                    if high >= entry_price + risk * self.breakeven_trigger_r:
+                        working_stop = max(working_stop, entry_price)
+                    if low <= working_stop:
+                        exit_price = working_stop * (1 - self.slippage_rate)
+                    elif high >= target_price:
+                        exit_price = target_price * (1 - self.slippage_rate)
+                    elif row.short_ma < row.long_ma:
+                        exit_price = float(row.close) * (1 - self.slippage_rate)
+                else:
+                    if (
+                        not partial_taken
+                        and self.partial_exit_fraction > 0
+                        and low <= entry_price - risk * self.partial_target_r
+                    ):
+                        partial_exit = (entry_price - risk * self.partial_target_r) * (1 + self.slippage_rate)
+                        partial_return = (entry_price - partial_exit) / entry_price
+                        partial_taken = True
+                        working_stop = entry_price
+                    if low <= entry_price - risk * self.breakeven_trigger_r:
+                        working_stop = min(working_stop, entry_price)
+                    if high >= working_stop:
+                        exit_price = working_stop * (1 + self.slippage_rate)
+                    elif low <= target_price:
+                        exit_price = target_price * (1 + self.slippage_rate)
+                    elif row.short_ma > row.long_ma:
+                        exit_price = float(row.close) * (1 + self.slippage_rate)
 
                 if exit_price is None:
                     peak = max(peak, equity)
@@ -141,7 +318,18 @@ class MovingAverageBacktester:
                     max_drawdown = max(max_drawdown, drawdown)
                     continue
 
-                trade_return = ((exit_price - entry_price) / entry_price) - (self.fee_rate * 2)
+                if position_direction == "long":
+                    final_return = (exit_price - entry_price) / entry_price
+                else:
+                    final_return = (entry_price - exit_price) / entry_price
+                if partial_taken:
+                    trade_return = (
+                        self.partial_exit_fraction * partial_return
+                        + (1 - self.partial_exit_fraction) * final_return
+                        - (self.fee_rate * 2)
+                    )
+                else:
+                    trade_return = final_return - (self.fee_rate * 2)
                 equity *= max(0.0, 1 + trade_return)
                 returns.append(trade_return)
                 if trade_return > 0:
@@ -174,10 +362,19 @@ class MovingAverageBacktester:
             expectancy_pct=expectancy * 100,
             average_win_pct=average_win * 100,
             average_loss_pct=average_loss * 100,
-            long_trades=trades,
-            short_trades=0,
+            long_trades=long_trades,
+            short_trades=short_trades,
             warnings=_backtest_warnings(trades, wins, losses),
         )
+
+    def _has_bearish_sequence(self, frame: pd.DataFrame, index: int) -> bool:
+        if self.min_short_bearish_sequence <= 1:
+            return True
+        start = index - self.min_short_bearish_sequence + 1
+        if start < 0:
+            return False
+        window = frame.iloc[start : index + 1]
+        return bool((window["close"] < window["open"]).all())
 
 
 @dataclass(frozen=True)
@@ -191,6 +388,16 @@ class StrategyBacktestConfig:
     min_relative_volume: float = 1.2
     min_risk_reward: float = 2.0
     max_hold_bars: int = 24
+    breakeven_trigger_r: float = 99.0
+    partial_target_r: float = 1.0
+    partial_exit_fraction: float = 0.0
+    min_body_atr: float = 0.0
+    min_ema_gap_atr: float = 0.0
+    min_macd_hist_atr: float = 0.0
+    min_risk_pct: float = 0.0
+    min_net_target_pct: float = 0.0
+    min_confluence_score: int = 0
+    allowed_setups: tuple[str, ...] = ("apex_squeeze", "bounce", "tabo", "alma_cci_scalp")
 
 
 @dataclass(frozen=True)
@@ -212,13 +419,7 @@ class MirandaStrategyBacktester:
         self.slippage_rate = config.slippage_bps / 10_000
 
     def run(self, symbol: str, timeframe: str, candles: pd.DataFrame) -> BacktestResult:
-        frame = candles.copy().reset_index(drop=True)
-        frame["rsi"] = rsi(frame["close"], 14)
-        frame["macd"], frame["macd_signal"] = macd(frame["close"])
-        frame["atr"] = atr(frame, 14)
-        frame["relative_volume"] = relative_volume(frame["volume"], 20)
-        frame["ema_20"] = frame["close"].ewm(span=20, adjust=False).mean()
-        frame["ema_50"] = frame["close"].ewm(span=50, adjust=False).mean()
+        frame = prepare_miranda_backtest_frame(candles)
 
         returns: list[float] = []
         setup_returns: dict[str, list[tuple[float, str]]] = {}
@@ -238,8 +439,11 @@ class MirandaStrategyBacktester:
                 index += 1
                 continue
 
-            exit_index, exit_price, exit_reason = self._resolve_exit(frame, index + 1, signal)
-            trade_return = self._trade_return(signal, exit_price)
+            exit_index, exit_price, exit_reason, trade_return = self._resolve_trade(
+                frame,
+                index + 1,
+                signal,
+            )
             returns.append(trade_return)
             setup_returns.setdefault(signal.setup, []).append((trade_return, signal.direction))
             equity *= max(0.0, 1 + trade_return)
@@ -300,22 +504,31 @@ class MirandaStrategyBacktester:
         row = frame.iloc[index]
         if row[["rsi", "macd", "macd_signal", "atr", "relative_volume", "ema_20", "ema_50"]].isna().any():
             return None
-        recent = frame.iloc[index - 24 : index + 1]
-        prior = frame.iloc[index - 60 : index]
-        if len(recent) < 25 or len(prior) < 40:
-            return None
+        recent = prior = None
+        has_cached_setups = "long_setup" in frame.columns and "short_setup" in frame.columns
+        if not has_cached_setups:
+            recent = frame.iloc[index - 24 : index + 1]
+            prior = frame.iloc[index - 60 : index]
+            if len(recent) < 25 or len(prior) < 40:
+                return None
         if float(row["relative_volume"]) < self.config.min_relative_volume:
             return None
 
         long_signal = self._long_signal(frame, index, recent, prior)
         short_signal = self._short_signal(frame, index, recent, prior)
-        if long_signal and self.config.allow_longs:
+        if long_signal and self.config.allow_longs and self._passes_confluence(frame, index, long_signal):
             return long_signal
-        if short_signal and self.config.allow_shorts:
+        if short_signal and self.config.allow_shorts and self._passes_confluence(frame, index, short_signal):
             return short_signal
         return None
 
-    def _long_signal(self, frame: pd.DataFrame, index: int, recent: pd.DataFrame, prior: pd.DataFrame) -> _Signal | None:
+    def _long_signal(
+        self,
+        frame: pd.DataFrame,
+        index: int,
+        recent: pd.DataFrame | None,
+        prior: pd.DataFrame | None,
+    ) -> _Signal | None:
         row = frame.iloc[index]
         if float(row["ema_20"]) <= float(row["ema_50"]):
             return None
@@ -323,12 +536,22 @@ class MirandaStrategyBacktester:
             return None
         if float(row["macd"]) <= float(row["macd_signal"]):
             return None
-        setup = _long_setup_name(recent, prior)
+        setup = row.get("long_setup")
+        if not isinstance(setup, str):
+            if recent is None or prior is None:
+                return None
+            setup = _long_setup_name(recent, prior)
         if setup is None:
             return None
         return self._build_signal("long", setup, float(row["close"]), float(row["atr"]))
 
-    def _short_signal(self, frame: pd.DataFrame, index: int, recent: pd.DataFrame, prior: pd.DataFrame) -> _Signal | None:
+    def _short_signal(
+        self,
+        frame: pd.DataFrame,
+        index: int,
+        recent: pd.DataFrame | None,
+        prior: pd.DataFrame | None,
+    ) -> _Signal | None:
         row = frame.iloc[index]
         if float(row["ema_20"]) >= float(row["ema_50"]):
             return None
@@ -336,7 +559,11 @@ class MirandaStrategyBacktester:
             return None
         if float(row["macd"]) >= float(row["macd_signal"]):
             return None
-        setup = _short_setup_name(recent, prior)
+        setup = row.get("short_setup")
+        if not isinstance(setup, str):
+            if recent is None or prior is None:
+                return None
+            setup = _short_setup_name(recent, prior)
         if setup is None:
             return None
         return self._build_signal("short", setup, float(row["close"]), float(row["atr"]))
@@ -350,35 +577,148 @@ class MirandaStrategyBacktester:
             stop = entry - risk
             target = entry + (risk * self.config.target_r_multiple)
             risk_reward = (target - entry) / (entry - stop)
+            target_exit = target * (1 - self.slippage_rate)
+            net_target_return = ((target_exit - entry) / entry) - (self.fee_rate * 2)
         else:
             entry = close * (1 - self.slippage_rate)
             stop = entry + risk
             target = entry - (risk * self.config.target_r_multiple)
             risk_reward = (entry - target) / (stop - entry)
+            target_exit = target * (1 + self.slippage_rate)
+            net_target_return = ((entry - target_exit) / entry) - (self.fee_rate * 2)
+        if entry > 0 and (risk / entry) * 100 < self.config.min_risk_pct:
+            return None
+        if net_target_return * 100 < self.config.min_net_target_pct:
+            return None
         if risk_reward < self.config.min_risk_reward:
             return None
         return _Signal(direction, setup, entry, stop, target, risk_reward)
 
+    def _passes_confluence(self, frame: pd.DataFrame, index: int, signal: _Signal) -> bool:
+        if signal.setup not in self.config.allowed_setups:
+            return False
+        row = frame.iloc[index]
+        atr_value = float(row["atr"])
+        if atr_value <= 0:
+            return False
+        close = float(row["close"])
+        open_price = float(row["open"])
+        ema_gap = abs(float(row["ema_20"]) - float(row["ema_50"]))
+        macd_hist = float(row["macd"]) - float(row["macd_signal"])
+        body = abs(close - open_price)
+        score = 0
+        if body >= atr_value * self.config.min_body_atr:
+            score += 1
+        if ema_gap >= atr_value * self.config.min_ema_gap_atr:
+            score += 1
+        if abs(macd_hist) >= atr_value * self.config.min_macd_hist_atr:
+            score += 1
+        if signal.direction == "long":
+            if close > open_price:
+                score += 1
+            if macd_hist > 0:
+                score += 1
+        else:
+            if close < open_price:
+                score += 1
+            if macd_hist < 0:
+                score += 1
+        return score >= self.config.min_confluence_score
+
     def _resolve_exit(self, frame: pd.DataFrame, start_index: int, signal: _Signal) -> tuple[int, float, str]:
+        exit_index, exit_price, exit_reason, _ = self._resolve_trade(frame, start_index, signal)
+        return exit_index, exit_price, exit_reason
+
+    def _resolve_trade(self, frame: pd.DataFrame, start_index: int, signal: _Signal) -> tuple[int, float, str, float]:
         last_index = min(len(frame) - 1, start_index + self.config.max_hold_bars)
+        risk = abs(signal.entry - signal.stop)
+        working_stop = signal.stop
+        partial_taken = False
+        partial_return = 0.0
+        partial_fraction = min(max(self.config.partial_exit_fraction, 0.0), 1.0)
+
         for index in range(start_index, last_index + 1):
             row = frame.iloc[index]
             high = float(row["high"])
             low = float(row["low"])
             if signal.direction == "long":
-                if low <= signal.stop:
-                    return index, signal.stop * (1 - self.slippage_rate), "stop"
+                if (
+                    not partial_taken
+                    and partial_fraction > 0
+                    and high >= signal.entry + risk * self.config.partial_target_r
+                ):
+                    partial_exit = (signal.entry + risk * self.config.partial_target_r) * (
+                        1 - self.slippage_rate
+                    )
+                    partial_return = (partial_exit - signal.entry) / signal.entry
+                    partial_taken = True
+                    working_stop = max(working_stop, signal.entry)
+                if high >= signal.entry + risk * self.config.breakeven_trigger_r:
+                    working_stop = max(working_stop, signal.entry)
+                if low <= working_stop:
+                    exit_price = working_stop * (1 - self.slippage_rate)
+                    reason = "breakeven" if working_stop >= signal.entry else "stop"
+                    return index, exit_price, reason, self._managed_trade_return(
+                        signal,
+                        exit_price,
+                        partial_taken,
+                        partial_return,
+                        partial_fraction,
+                    )
                 if high >= signal.target:
-                    return index, signal.target * (1 - self.slippage_rate), "target"
+                    exit_price = signal.target * (1 - self.slippage_rate)
+                    return index, exit_price, "target", self._managed_trade_return(
+                        signal,
+                        exit_price,
+                        partial_taken,
+                        partial_return,
+                        partial_fraction,
+                    )
             else:
-                if high >= signal.stop:
-                    return index, signal.stop * (1 + self.slippage_rate), "stop"
+                if (
+                    not partial_taken
+                    and partial_fraction > 0
+                    and low <= signal.entry - risk * self.config.partial_target_r
+                ):
+                    partial_exit = (signal.entry - risk * self.config.partial_target_r) * (
+                        1 + self.slippage_rate
+                    )
+                    partial_return = (signal.entry - partial_exit) / signal.entry
+                    partial_taken = True
+                    working_stop = min(working_stop, signal.entry)
+                if low <= signal.entry - risk * self.config.breakeven_trigger_r:
+                    working_stop = min(working_stop, signal.entry)
+                if high >= working_stop:
+                    exit_price = working_stop * (1 + self.slippage_rate)
+                    reason = "breakeven" if working_stop <= signal.entry else "stop"
+                    return index, exit_price, reason, self._managed_trade_return(
+                        signal,
+                        exit_price,
+                        partial_taken,
+                        partial_return,
+                        partial_fraction,
+                    )
                 if low <= signal.target:
-                    return index, signal.target * (1 + self.slippage_rate), "target"
+                    exit_price = signal.target * (1 + self.slippage_rate)
+                    return index, exit_price, "target", self._managed_trade_return(
+                        signal,
+                        exit_price,
+                        partial_taken,
+                        partial_return,
+                        partial_fraction,
+                    )
         close = float(frame.iloc[last_index]["close"])
         if signal.direction == "long":
-            return last_index, close * (1 - self.slippage_rate), "time"
-        return last_index, close * (1 + self.slippage_rate), "time"
+            exit_price = close * (1 - self.slippage_rate)
+        else:
+            exit_price = close * (1 + self.slippage_rate)
+        return last_index, exit_price, "time", self._managed_trade_return(
+            signal,
+            exit_price,
+            partial_taken,
+            partial_return,
+            partial_fraction,
+        )
 
     def _trade_return(self, signal: _Signal, exit_price: float) -> float:
         if signal.direction == "long":
@@ -386,6 +726,23 @@ class MirandaStrategyBacktester:
         else:
             raw = (signal.entry - exit_price) / signal.entry
         return raw - (self.fee_rate * 2)
+
+    def _managed_trade_return(
+        self,
+        signal: _Signal,
+        exit_price: float,
+        partial_taken: bool,
+        partial_return: float,
+        partial_fraction: float,
+    ) -> float:
+        final_return = self._trade_return(signal, exit_price) + (self.fee_rate * 2)
+        if not partial_taken:
+            return final_return - (self.fee_rate * 2)
+        return (
+            partial_fraction * partial_return
+            + (1 - partial_fraction) * final_return
+            - (self.fee_rate * 2)
+        )
 
 
 def _long_setup_name(recent: pd.DataFrame, prior: pd.DataFrame) -> str | None:
@@ -474,12 +831,7 @@ class AlmaCciScalpBacktester:
         self.slippage_rate = config.slippage_bps / 10_000
 
     def run(self, symbol: str, timeframe: str, candles: pd.DataFrame) -> BacktestResult:
-        frame = candles.copy().reset_index(drop=True)
-        frame["ema_9"] = ema(frame["close"], 9)
-        frame["alma_20"] = alma(frame["close"], 20, 0.8, 8)
-        frame["cci_20"] = cci(frame, 20)
-        frame["atr"] = atr(frame, 14)
-        frame["relative_volume"] = relative_volume(frame["volume"], 20)
+        frame = prepare_scalp_backtest_frame(candles)
 
         returns: list[float] = []
         setup_returns: dict[str, list[tuple[float, str]]] = {}
@@ -494,12 +846,13 @@ class AlmaCciScalpBacktester:
             if signal is None:
                 index += 1
                 continue
-            exit_index, exit_price, exit_reason = MirandaStrategyBacktester(self.config)._resolve_exit(
+            exit_index, exit_price, exit_reason, trade_return = MirandaStrategyBacktester(
+                self.config,
+            )._resolve_trade(
                 frame,
                 index + 1,
                 signal,
             )
-            trade_return = MirandaStrategyBacktester(self.config)._trade_return(signal, exit_price)
             returns.append(trade_return)
             setup_returns.setdefault(signal.setup, []).append((trade_return, signal.direction))
             equity *= max(0.0, 1 + trade_return)
@@ -557,11 +910,43 @@ class AlmaCciScalpBacktester:
         short_cross = float(prior["ema_9"]) >= float(prior["alma_20"]) and float(row["ema_9"]) < float(row["alma_20"])
         long_cci = float(prior["cci_20"]) <= -100 < float(row["cci_20"])
         short_cci = float(prior["cci_20"]) >= 100 > float(row["cci_20"])
-        if self.config.allow_longs and long_cross and long_cci:
+        if self.config.allow_longs and long_cross and long_cci and self._passes_scalp_confluence(row, "long"):
             return self._build_signal("long", float(row["close"]), float(row["atr"]))
-        if self.config.allow_shorts and short_cross and short_cci:
+        if self.config.allow_shorts and short_cross and short_cci and self._passes_scalp_confluence(row, "short"):
             return self._build_signal("short", float(row["close"]), float(row["atr"]))
         return None
+
+    def _passes_scalp_confluence(self, row: pd.Series, direction: str) -> bool:
+        if "alma_cci_scalp" not in self.config.allowed_setups:
+            return False
+        atr_value = float(row["atr"])
+        if atr_value <= 0:
+            return False
+        close = float(row["close"])
+        open_price = float(row["open"])
+        body = abs(close - open_price)
+        ema_gap = abs(float(row["ema_9"]) - float(row["alma_20"]))
+        cci_value = float(row["cci_20"])
+        score = 0
+        if body >= atr_value * self.config.min_body_atr:
+            score += 1
+        if ema_gap >= atr_value * self.config.min_ema_gap_atr:
+            score += 1
+        if direction == "long":
+            if close > open_price:
+                score += 1
+            if float(row["ema_9"]) > float(row["alma_20"]):
+                score += 1
+            if cci_value > -50:
+                score += 1
+        else:
+            if close < open_price:
+                score += 1
+            if float(row["ema_9"]) < float(row["alma_20"]):
+                score += 1
+            if cci_value < 50:
+                score += 1
+        return score >= self.config.min_confluence_score
 
     def _build_signal(self, direction: str, close: float, atr_value: float) -> _Signal | None:
         risk = atr_value * self.config.stop_atr_multiple
@@ -572,11 +957,19 @@ class AlmaCciScalpBacktester:
             stop = entry - risk
             target = entry + risk * self.config.target_r_multiple
             rr = (target - entry) / (entry - stop)
+            target_exit = target * (1 - self.slippage_rate)
+            net_target_return = ((target_exit - entry) / entry) - (self.fee_rate * 2)
         else:
             entry = close * (1 - self.slippage_rate)
             stop = entry + risk
             target = entry - risk * self.config.target_r_multiple
             rr = (entry - target) / (stop - entry)
+            target_exit = target * (1 + self.slippage_rate)
+            net_target_return = ((entry - target_exit) / entry) - (self.fee_rate * 2)
+        if entry > 0 and (risk / entry) * 100 < self.config.min_risk_pct:
+            return None
+        if net_target_return * 100 < self.config.min_net_target_pct:
+            return None
         if rr < self.config.min_risk_reward:
             return None
         return _Signal(direction, "alma_cci_scalp", entry, stop, target, rr)

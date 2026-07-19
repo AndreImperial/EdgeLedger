@@ -1,15 +1,15 @@
 import { demoSignals } from './data'
-import type { CmmScalpResult, CmmScanResult, NormalizedSignal, OpenInterestRow, ScanRunSummary, ScreenerRow, SignalLifecycle, StrategyKey } from './types'
+import type { BacktestBatchRow, CmmScalpResult, CmmScanResult, NormalizedSignal, OpenInterestRow, ScanRunSummary, ScreenerRow, SignalLifecycle, StrategyKey } from './types'
 import { stableSignalId } from './utils'
 
 const API_URL = (import.meta.env.VITE_CMM_API_URL || '').replace(/\/$/, '')
-const labels: Record<StrategyKey, string> = { bounce: 'Bounce', apex_squeeze: 'Apex Squeeze', transition_play: 'Transition Play', tabo: 'TABO', alma_cci_scalp: 'ALMA / CCI Scalp' }
+const labels: Record<StrategyKey, string> = { bounce: 'Bounce', apex_squeeze: 'Apex Squeeze', transition_play: 'Transition Play', tabo: 'TABO', alma_cci_scalp: 'ALMA / CCI Scalp', ma_short: 'Validated MA Short' }
 
 export interface ApiStatus { connected: boolean; mode: 'live' | 'demo'; message: string; dataMode?: string; paperOnly?: boolean }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string, init?: RequestInit, timeoutMs = 180000): Promise<T> {
   const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), 180000)
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs)
   try {
     const response = await fetch(`${API_URL}${path}`, { ...init, signal: controller.signal })
     if (!response.ok) throw new Error(`EdgeLedger scanner returned ${response.status}`)
@@ -99,6 +99,14 @@ export async function fetchOpenInterest() {
 
 export async function fetchMarketScreener() {
   return request<{ source: string; updatedAt: string; warnings: string[]; rows: ScreenerRow[] }>('/api/market-screener')
+}
+
+export async function runBacktestBatch() {
+  return request<{ source: string; timeframe: string; strategy: string; side: string; rows: BacktestBatchRow[] }>(
+    '/api/backtest-batch?strategy=ma&timeframe=15m&side=auto',
+    { method: 'POST' },
+    900000,
+  )
 }
 
 export { API_URL }

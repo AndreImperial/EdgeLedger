@@ -36,6 +36,7 @@ class Settings:
     timeframe: str
     timeframes: list[str]
     candle_limit: int
+    backtest_candle_limit: int
     discovery_limit: int
     discovery_pool_limit: int
     prefilter_limit: int
@@ -69,6 +70,32 @@ class Settings:
     backtest_slippage_bps: float
     backtest_stop_atr_multiple: float
     backtest_target_r_multiple: float
+    backtest_min_risk_reward: float
+    backtest_min_relative_volume: float
+    backtest_min_body_atr: float
+    backtest_min_ema_gap_atr: float
+    backtest_min_macd_hist_atr: float
+    backtest_min_risk_pct: float
+    backtest_scalp_min_risk_pct: float
+    backtest_min_net_target_pct: float
+    backtest_ma_side: str
+    backtest_ma_stop_atr_multiple: float
+    backtest_ma_target_r_multiple: float
+    backtest_ma_rsi_buy_max: float
+    backtest_ma_min_body_atr: float
+    backtest_ma_min_gap_atr: float
+    backtest_ma_min_risk_pct: float
+    backtest_ma_preferred_bases: list[str]
+    backtest_ma_excluded_bases: list[str]
+    backtest_ma_min_batch_win_rate: float
+    backtest_ma_validation_candle_limit: int
+    backtest_ma_min_validation_win_rate: float
+    backtest_ma_symbol_overrides: dict[str, dict[str, float]]
+    backtest_min_confluence_score: int
+    backtest_allowed_setups: list[str]
+    backtest_breakeven_trigger_r: float
+    backtest_partial_target_r: float
+    backtest_partial_exit_fraction: float
     backtest_limit: int
     journal_db: str
     telegram_bot_token: str | None
@@ -84,6 +111,7 @@ class Settings:
     scalp_scan_limit: int
     scalp_universe_limit: int
     scalp_candle_limit: int
+    backtest_scalp_candle_limit: int
     scalp_min_volume_24h_usd: float
     scalp_alert_cooldown_minutes: int
     scalp_min_atr_pct: float
@@ -120,6 +148,7 @@ class Settings:
             timeframe=timeframe,
             timeframes=timeframes,
             candle_limit=_env_int("CANDLE_LIMIT", "200", min_value=50),
+            backtest_candle_limit=_env_int("BACKTEST_CANDLE_LIMIT", "60000", min_value=50),
             discovery_limit=discovery_limit,
             discovery_pool_limit=_env_int("DISCOVERY_POOL_LIMIT", "250", min_value=1),
             prefilter_limit=_env_int("PREFILTER_LIMIT", str(discovery_limit), min_value=1),
@@ -142,7 +171,7 @@ class Settings:
             short_ma=_env_int("SHORT_MA", "20", min_value=1),
             long_ma=_env_int("LONG_MA", "50", min_value=2),
             rsi_period=_env_int("RSI_PERIOD", "14", min_value=2),
-            rsi_buy_max=_env_float("RSI_BUY_MAX", "65", min_value=0, max_value=100),
+            rsi_buy_max=_env_float("RSI_BUY_MAX", "55", min_value=0, max_value=100),
             rsi_sell_min=_env_float("RSI_SELL_MIN", "35", min_value=0, max_value=100),
             starting_cash=_env_float("STARTING_CASH", "10000", min_value=0),
             max_position_usd=_env_float("MAX_POSITION_USD", "1000", min_value=0),
@@ -162,8 +191,128 @@ class Settings:
             ),
             backtest_target_r_multiple=_env_float(
                 "BACKTEST_TARGET_R_MULTIPLE",
-                "2",
+                "1",
                 min_value=0.01,
+            ),
+            backtest_min_risk_reward=_env_float(
+                "BACKTEST_MIN_RISK_REWARD",
+                "1",
+                min_value=0.01,
+            ),
+            backtest_min_relative_volume=_env_float(
+                "BACKTEST_MIN_RELATIVE_VOLUME",
+                "1.2",
+                min_value=0,
+            ),
+            backtest_min_body_atr=_env_float(
+                "BACKTEST_MIN_BODY_ATR",
+                "0.15",
+                min_value=0,
+            ),
+            backtest_min_ema_gap_atr=_env_float(
+                "BACKTEST_MIN_EMA_GAP_ATR",
+                "0.1",
+                min_value=0,
+            ),
+            backtest_min_macd_hist_atr=_env_float(
+                "BACKTEST_MIN_MACD_HIST_ATR",
+                "0.02",
+                min_value=0,
+            ),
+            backtest_min_risk_pct=_env_float(
+                "BACKTEST_MIN_RISK_PCT",
+                "0.25",
+                min_value=0,
+            ),
+            backtest_scalp_min_risk_pct=_env_float(
+                "BACKTEST_SCALP_MIN_RISK_PCT",
+                "0.2",
+                min_value=0,
+            ),
+            backtest_min_net_target_pct=_env_float(
+                "BACKTEST_MIN_NET_TARGET_PCT",
+                "0",
+                min_value=0,
+            ),
+            backtest_ma_side=_env_choice("BACKTEST_MA_SIDE", "short", {"both", "long", "short"}),
+            backtest_ma_stop_atr_multiple=_env_float(
+                "BACKTEST_MA_STOP_ATR_MULTIPLE",
+                "1.5",
+                min_value=0.01,
+            ),
+            backtest_ma_target_r_multiple=_env_float(
+                "BACKTEST_MA_TARGET_R_MULTIPLE",
+                "0.75",
+                min_value=0.01,
+            ),
+            backtest_ma_rsi_buy_max=_env_float(
+                "BACKTEST_MA_RSI_BUY_MAX",
+                "60",
+                min_value=0,
+                max_value=100,
+            ),
+            backtest_ma_min_body_atr=_env_float(
+                "BACKTEST_MA_MIN_BODY_ATR",
+                "0.1",
+                min_value=0,
+            ),
+            backtest_ma_min_gap_atr=_env_float(
+                "BACKTEST_MA_MIN_GAP_ATR",
+                "0.3",
+                min_value=0,
+            ),
+            backtest_ma_min_risk_pct=_env_float(
+                "BACKTEST_MA_MIN_RISK_PCT",
+                "0.35",
+                min_value=0,
+            ),
+            backtest_ma_preferred_bases=_env_csv("BACKTEST_MA_PREFERRED_BASES", "BTC,ETH,XRP,DOT"),
+            backtest_ma_excluded_bases=_env_csv("BACKTEST_MA_EXCLUDED_BASES", "DOGE,AVAX"),
+            backtest_ma_min_batch_win_rate=_env_float(
+                "BACKTEST_MA_MIN_BATCH_WIN_RATE",
+                "1.0",
+                min_value=0,
+                max_value=1,
+            ),
+            backtest_ma_validation_candle_limit=_env_int(
+                "BACKTEST_MA_VALIDATION_CANDLE_LIMIT",
+                "100000",
+                min_value=0,
+            ),
+            backtest_ma_min_validation_win_rate=_env_float(
+                "BACKTEST_MA_MIN_VALIDATION_WIN_RATE",
+                "1.0",
+                min_value=0,
+                max_value=1,
+            ),
+            backtest_ma_symbol_overrides=_env_symbol_float_overrides(
+                "BACKTEST_MA_SYMBOL_OVERRIDES",
+                "ETH:rsi_buy_max=50,target_r=0.18,min_body_atr=0.3,min_gap_atr=0.75,min_risk_pct=0.35,short_rsi_max=75,max_short_close_position=0.35,min_short_bearish_sequence=2;XRP:rsi_buy_max=50,target_r=0.3,min_body_atr=0.2,min_gap_atr=0.6,min_risk_pct=0.35,short_rsi_max=75,max_short_close_position=0.5",
+            ),
+            backtest_min_confluence_score=_env_int(
+                "BACKTEST_MIN_CONFLUENCE_SCORE",
+                "3",
+                min_value=0,
+            ),
+            backtest_allowed_setups=_env_csv(
+                "BACKTEST_ALLOWED_SETUPS",
+                "apex_squeeze,bounce,alma_cci_scalp",
+            ),
+            backtest_breakeven_trigger_r=_env_float(
+                "BACKTEST_BREAKEVEN_TRIGGER_R",
+                "99",
+                min_value=0.01,
+            ),
+            backtest_partial_target_r=_env_float(
+                "BACKTEST_PARTIAL_TARGET_R",
+                "1",
+                min_value=0.01,
+            ),
+            backtest_partial_exit_fraction=_env_float(
+                "BACKTEST_PARTIAL_EXIT_FRACTION",
+                "0",
+                min_value=0,
+                max_value=1,
             ),
             backtest_limit=_env_int("BACKTEST_LIMIT", "25", min_value=1),
             journal_db=_env_str("JOURNAL_DB", "coach_miranda_miner.sqlite3"),
@@ -184,6 +333,11 @@ class Settings:
             scalp_scan_limit=_env_int("SCALP_SCAN_LIMIT", "100", min_value=1),
             scalp_universe_limit=_env_int("SCALP_UNIVERSE_LIMIT", "250", min_value=1),
             scalp_candle_limit=_env_int("SCALP_CANDLE_LIMIT", "240", min_value=50),
+            backtest_scalp_candle_limit=_env_int(
+                "BACKTEST_SCALP_CANDLE_LIMIT",
+                "3000",
+                min_value=50,
+            ),
             scalp_min_volume_24h_usd=_env_float(
                 "SCALP_MIN_VOLUME_24H_USD",
                 "5000000",
@@ -244,6 +398,42 @@ def _env_float(
         raise ConfigurationError(f"{name} must be a number, got {raw!r}.") from exc
     _validate_range(name, value, min_value=min_value, max_value=max_value)
     return value
+
+
+def _env_symbol_float_overrides(name: str, default: str) -> dict[str, dict[str, float]]:
+    raw = os.getenv(name, default).strip()
+    if not raw:
+        return {}
+    overrides: dict[str, dict[str, float]] = {}
+    for item in raw.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ConfigurationError(f"{name} entries must look like BASE:key=value.")
+        base, assignments = item.split(":", 1)
+        base = base.strip().upper()
+        if not base:
+            raise ConfigurationError(f"{name} override base must not be empty.")
+        values: dict[str, float] = {}
+        for assignment in assignments.split(","):
+            assignment = assignment.strip()
+            if not assignment:
+                continue
+            if "=" not in assignment:
+                raise ConfigurationError(f"{name} assignments must look like key=value.")
+            key, raw_value = assignment.split("=", 1)
+            key = key.strip().lower()
+            try:
+                values[key] = float(raw_value)
+            except ValueError as exc:
+                raise ConfigurationError(
+                    f"{name} override {base}:{key} must be numeric, got {raw_value!r}."
+                ) from exc
+        if not values:
+            raise ConfigurationError(f"{name} override {base} must include at least one assignment.")
+        overrides[base] = values
+    return overrides
 
 
 def _env_bool(name: str, default: str) -> bool:
